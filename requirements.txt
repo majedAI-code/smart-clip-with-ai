@@ -1,6 +1,6 @@
 streamlit
 google-generativeai
 elevenlabs
-moviepy
+moviepy==1.0.3
 yt-dlp
 ffmpeg-python
