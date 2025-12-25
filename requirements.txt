@@ -1,0 +1,6 @@
+streamlit
+google-generativeai
+elevenlabs
+moviepy
+yt-dlp
+ffmpeg-python
