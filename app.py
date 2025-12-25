@@ -58,10 +58,28 @@ def detect_speaker_gender(audio_path):
 
 def download_youtube_video(url):
     output_filename = "downloaded_video.mp4"
-    if os.path.exists(output_filename): os.remove(output_filename)
-    ydl_opts = {'format': 'best[ext=mp4]', 'outtmpl': 'downloaded_video.%(ext)s', 'quiet': True}
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl: ydl.download([url])
-    return output_filename
+    if os.path.exists(output_filename):
+        os.remove(output_filename)
+    
+    # خيارات متقدمة لخداع الحماية
+    ydl_opts = {
+        'format': 'best[ext=mp4]/best',
+        'outtmpl': 'downloaded_video.%(ext)s',
+        'quiet': True,
+        'no_warnings': True,
+        # هذا السطر مهم جداً: يجعل الطلب يبدو كأنه من متصفح كروم
+        'http_headers': {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+        }
+    }
+    
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])
+        return output_filename
+    except Exception as e:
+        # في حال الفشل، نعيد الخطأ لنراه
+        raise e
 
 def extract_audio(video_path):
     video = VideoFileClip(video_path)
