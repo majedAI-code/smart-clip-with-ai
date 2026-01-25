@@ -2,18 +2,24 @@ import streamlit as st
 import os
 import json
 import time
-import socket
 import google.generativeai as genai
 from elevenlabs.client import ElevenLabs
 from moviepy.editor import VideoFileClip, AudioFileClip
-import yt_dlp
 
-# --- إعدادات الصفحة والهوية البصرية ---
+# --- إعدادات الصفحة ---
 st.set_page_config(
     page_title="استوديو المحتوى الذكي",
     page_icon="🎬",
-    layout="centered"
+    layout="centered",
+    initial_sidebar_state="collapsed"
 )
+
+# --- دوال بصرية ---
+def render_header(image_name, alt_text):
+    if os.path.exists(image_name):
+        st.image(image_name, use_column_width=True)
+    else:
+        st.header(alt_text)
 
 # --- تحميل المفاتيح ---
 def load_api_keys():
@@ -30,42 +36,45 @@ GOOGLE_API_KEY, ELEVENLABS_API_KEY = load_api_keys()
 genai.configure(api_key=GOOGLE_API_KEY)
 eleven_client = ElevenLabs(api_key=ELEVENLABS_API_KEY)
 
-# --- إدارة الذاكرة (Session State) لحل مشكلة اختفاء التحميل ---
-if 'processed' not in st.session_state:
-    st.session_state['processed'] = False
-if 'dubbed_video' not in st.session_state:
-    st.session_state['dubbed_video'] = None
-if 'clips_list' not in st.session_state:
-    st.session_state['clips_list'] = []
+# --- (الحل الجذري) دالة اكتشاف الموديل الصحيح ---
+@st.cache_resource
+def get_working_model_name():
+    # قائمة الموديلات المحتملة
+    candidates = [
+        "gemini-1.5-flash", 
+        "models/gemini-1.5-flash", 
+        "gemini-1.5-pro", 
+        "models/gemini-1.5-pro", 
+        "gemini-pro"
+    ]
+    try:
+        # نسأل جوجل: ما هي الموديلات المتاحة لهذا المفتاح؟
+        available_models = [m.name for m in genai.list_models()]
+        for c in candidates:
+            if c in available_models or f"models/{c}" in available_models:
+                return c
+    except:
+        pass
+    return "gemini-1.5-flash" # احتياطي
+
+CURRENT_MODEL_NAME = get_working_model_name()
+
+# --- إدارة الذاكرة (Session State) ---
+if 'analysis_done' not in st.session_state: st.session_state['analysis_done'] = False
+if 'clips_data' not in st.session_state: st.session_state['clips_data'] = []
+if 'dubbed_video' not in st.session_state: st.session_state['dubbed_video'] = None
+if 'generated_clips' not in st.session_state: st.session_state['generated_clips'] = []
 
 # --- دوال المعالجة ---
 
 def check_video_duration(video_path, max_minutes=5):
     try:
         clip = VideoFileClip(video_path)
-        duration_sec = clip.duration
+        dur = clip.duration
         clip.close()
-        if duration_sec > (max_minutes * 60):
-            return False, duration_sec
-        return True, duration_sec
-    except:
-        return True, 0
-
-def get_best_model():
-    return 'models/gemini-1.5-flash'
-
-CURRENT_MODEL_NAME = get_best_model()
-
-def detect_speaker_gender(audio_path):
-    model = genai.GenerativeModel(CURRENT_MODEL_NAME)
-    try:
-        with open(audio_path, "rb") as f:
-            audio_data = f.read()
-        prompt = "Listen to this audio. Identify the gender of the MAIN speaker. Return ONLY one word: 'Male' or 'Female'."
-        response = model.generate_content([prompt, {"mime_type": "audio/mp3", "data": audio_data}])
-        if "female" in response.text.strip().lower(): return "female"
-        return "male"
-    except: return "male"
+        if dur > max_minutes * 60: return False, dur
+        return True, dur
+    except: return True, 0
 
 def extract_audio(video_path):
     video = VideoFileClip(video_path)
@@ -74,12 +83,24 @@ def extract_audio(video_path):
     video.close()
     return audio_path
 
+def detect_speaker_gender(audio_path):
+    model = genai.GenerativeModel(CURRENT_MODEL_NAME)
+    try:
+        with open(audio_path, "rb") as f: audio_data = f.read()
+        prompt = "Identify the gender of the MAIN speaker. Return 'Male' or 'Female'."
+        response = model.generate_content([prompt, {"mime_type": "audio/mp3", "data": audio_data}])
+        if "female" in response.text.strip().lower(): return "female"
+        return "male"
+    except: return "male"
+
 def transcribe_and_translate(audio_path, target_lang):
     model = genai.GenerativeModel(CURRENT_MODEL_NAME)
-    with open(audio_path, "rb") as f: audio_data = f.read()
-    prompt = f"Listen to this audio. Transcribe and translate the content to {target_lang}. Return ONLY the translated text suitable for dubbing."
-    result = model.generate_content([prompt, {"mime_type": "audio/mp3", "data": audio_data}])
-    return result.text
+    try:
+        with open(audio_path, "rb") as f: audio_data = f.read()
+        prompt = f"Transcribe and translate to {target_lang}. Return ONLY the translation text."
+        response = model.generate_content([prompt, {"mime_type": "audio/mp3", "data": audio_data}])
+        return response.text
+    except: return None
 
 def generate_dubbed_audio(text, voice_id):
     try:
@@ -90,9 +111,7 @@ def generate_dubbed_audio(text, voice_id):
         with open(save_path, "wb") as f:
             for chunk in audio_generator: f.write(chunk)
         return save_path
-    except Exception as e:
-        st.warning(f"⚠️ تجاوز الدبلجة بسبب: {e}")
-        return None
+    except: return None
 
 def merge_audio_video(video_path, audio_path):
     video = VideoFileClip(video_path)
@@ -106,23 +125,21 @@ def merge_audio_video(video_path, audio_path):
     new_audio.close()
     return output_path
 
-# --- الدالة الجديدة: القص الذكي الديناميكي ---
-def get_viral_clips_dynamic(video_path):
-    model = genai.GenerativeModel(CURRENT_MODEL_NAME)
-    myfile = genai.upload_file(video_path)
-    while myfile.state.name == "PROCESSING":
-        time.sleep(2)
-        myfile = genai.get_file(myfile.name)
-    
-    # هنا الذكاء: لا نطلب عدداً محدداً، نطلب منه اختيار الأفضل فقط
-    prompt = """
-    Analyze the video carefully. Identify the MOST viral and engaging segments (Shorts/Reels).
-    - Select only segments that stand out (funny, insightful, shocking, or summarized).
-    - Duration of each clip: between 15 to 60 seconds.
-    - Return a JSON list: [{"start": 10, "end": 40, "label": "Topic 1"}, ...]
-    - If the video is boring, return an empty list.
+def analyze_video_for_clips(video_path):
     """
+    هذه الدالة فقط تحلل وتخبرنا بعدد المقاطع دون قص
+    """
+    model = genai.GenerativeModel(CURRENT_MODEL_NAME)
     try:
+        myfile = genai.upload_file(video_path)
+        while myfile.state.name == "PROCESSING":
+            time.sleep(1)
+            myfile = genai.get_file(myfile.name)
+            
+        prompt = """
+        Analyze the video. Identify MOST viral segments (15-60s).
+        Return valid JSON only: [{"start": 10, "end": 40, "label": "Topic"}]
+        """
         response = model.generate_content([prompt, myfile])
         text = response.text.replace("```json", "").replace("```", "").strip()
         return json.loads(text)
@@ -132,138 +149,118 @@ def cut_clips_processing(original_video_path, timestamps):
     video = VideoFileClip(original_video_path)
     generated_files = []
     for i, item in enumerate(timestamps):
-        start = item.get('start')
-        end = item.get('end')
-        label = item.get('label', f'Clip {i+1}')
         try:
+            start, end = item.get('start'), item.get('end')
+            label = item.get('label', f'Clip {i+1}')
             clip = video.subclip(start, end)
-            # تحويل للأبعاد الرأسية للموبايل (اختياري، هنا نقص فقط)
-            output_name = f"clip_{i+1}_{label}.mp4"
-            clip.write_videofile(output_name, codec="libx264", audio_codec="aac", logger=None)
-            generated_files.append({"path": output_name, "label": label})
+            name = f"clip_{i}_{label}.mp4"
+            clip.write_videofile(name, codec="libx264", audio_codec="aac", logger=None)
+            generated_files.append({"path": name, "label": label})
         except: continue
     video.close()
     return generated_files
 
-# --- واجهة التطبيق ---
+# --- الواجهة (UI) ---
 
-st.title("استوديو المحتوى الذكي")
+render_header("banner.jpg", "استوديو المحتوى الذكي")
 st.caption("أتمتة صناعة المحتوى الإعلامي باستخدام الذكاء الاصطناعي التوليدي")
 
-# 1. قسم الرفع
-st.header("1. رفع الفيديو")
-upload_option = st.radio("الطريقة:", ["رفع ملف", "فيديو تجريبي (Demo)"], horizontal=True)
+st.markdown("### 1. رفع الفيديو")
+upload_option = st.radio("المصدر:", ["رفع ملف", "فيديو تجريبي (Demo)"], horizontal=True)
 video_path = None
 
 if upload_option == "رفع ملف":
-    uploaded_file = st.file_uploader("اختر ملف MP4", type=["mp4"])
+    uploaded_file = st.file_uploader("ملف MP4", type=["mp4"])
     if uploaded_file:
         with open("temp_video.mp4", "wb") as f: f.write(uploaded_file.getbuffer())
         video_path = "temp_video.mp4"
 elif upload_option == "فيديو تجريبي (Demo)":
-    if os.path.exists("sample.mp4"):
+    if st.button("تحميل الفيديو التجريبي") and os.path.exists("sample.mp4"):
         video_path = "sample.mp4"
-        st.success("✅ تم تحميل الفيديو التجريبي")
-    else:
-        st.error("لم يتم العثور على sample.mp4")
+        st.success("تم تحميل الفيديو التجريبي!")
 
 if video_path:
     # فحص المدة
     valid, dur = check_video_duration(video_path, 5)
     if not valid:
-        st.error(f"فيديو طويل جداً ({int(dur/60)} دقيقة). الحد الأقصى 5 دقائق.")
-        st.stop()
-    
-    st.video(video_path)
-    
-    st.divider()
-    st.header("2. خيارات المعالجة")
-    
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        st.subheader("الدبلجة الذكية")
-        st.caption("Smart Dubbing")
-        enable_dubbing = st.checkbox("تفعيل الدبلجة")
-        target_lang = st.selectbox("اللغة المستهدفة", ["English", "Arabic", "French", "Spanish", "Chinese"])
+        st.error(f"الفيديو طويل ({int(dur/60)} دقيقة). الحد الأقصى 5 دقائق.")
+    else:
+        st.video(video_path)
+        st.divider()
         
-    with col2:
-        st.subheader("القص الذكي")
-        st.caption("Viral Clipping")
-        enable_clipping = st.checkbox("استخراج المقاطع الأكثر رواجاً")
-        st.info("🤖 سيقوم الذكاء الاصطناعي بتحديد عدد ومدّة المقاطع تلقائياً حسب المحتوى.")
+        # --- المرحلة 1: الخيارات والتحليل ---
+        c1, c2 = st.columns(2)
+        with c1:
+            render_header("dubbing.png", "🎙️ الدبلجة")
+            enable_dubbing = st.checkbox("تفعيل الدبلجة")
+            target_lang = st.selectbox("اللغة", ["Arabic", "English", "French"])
+        with c2:
+            render_header("clipping.png", "✂️ القص الذكي")
+            enable_clipping = st.checkbox("استخراج المقاطع")
 
-    # زر التشغيل
-    if st.button("🚀 بدء التحليل والمعالجة"):
-        st.session_state['processed'] = True # حفظ حالة أننا بدأنا
-        st.session_state['dubbed_video'] = None
-        st.session_state['clips_list'] = [] # تصفير القائمة القديمة
-        
-        with st.status("جاري العمل في الاستوديو...", expanded=True) as status:
+        # زر التحليل الأولي
+        if st.button("🔍 تحليل الفيديو (كم مقطع؟)", use_container_width=True):
+            st.session_state['analysis_done'] = False # تصفير الحالة القديمة
+            st.session_state['clips_data'] = []
             
-            # --- معالجة الدبلجة ---
-            if enable_dubbing:
-                status.write("🎙️ تحليل الصوت والهوية...")
-                audio_path = extract_audio(video_path)
-                gender = detect_speaker_gender(audio_path)
+            with st.spinner("جاري سؤال الذكاء الاصطناعي عن المقاطع المناسبة..."):
+                # تحليل القص
+                if enable_clipping:
+                    clips_found = analyze_video_for_clips(video_path)
+                    st.session_state['clips_data'] = clips_found
                 
-                status.write(f"detected gender: {gender}. Translating...")
-                translated_text = transcribe_and_translate(audio_path, target_lang)
-                
-                # اختيار الصوت بناءً على الجنس
-                voice_id = "21m00Tcm4TlvDq8ikWAM" if gender == "female" else "pNInz6obpgDQGcFmaJgB"
-                
-                status.write("🗣️ توليد الدبلجة...")
-                dubbed_audio = generate_dubbed_audio(translated_text, voice_id)
-                
-                if dubbed_audio:
-                    final_video = merge_audio_video(video_path, dubbed_audio)
-                    st.session_state['dubbed_video'] = final_video
-                else:
-                    st.warning("تم تخطي الدبلجة لسبب تقني، سيتم عرض الفيديو الأصلي.")
+                # حفظ حالة أن التحليل تم
+                st.session_state['analysis_done'] = True
 
-            # --- معالجة القص الذكي ---
-            if enable_clipping:
-                status.write("🧠 Gemini يشاهد الفيديو ويحدد اللقطات الفيروسية...")
-                # هنا لا نحدد العدد، نترك Gemini يقرر
-                clips_data = get_viral_clips_dynamic(video_path)
-                
-                if clips_data:
-                    status.write(f"✂️ وجدنا {len(clips_data)} مقاطع مميزة. جاري القص...")
-                    generated_clips = cut_clips_processing(video_path, clips_data)
-                    st.session_state['clips_list'] = generated_clips
-                else:
-                    st.warning("لم يجد الذكاء الاصطناعي مقاطع فيروسية واضحة في هذا الفيديو.")
-            
-            status.update(label="✅ تمت المهمة!", state="complete")
-
-# --- عرض النتائج (مفصول عن الزر لضمان الثبات) ---
-if st.session_state['processed']:
-    st.divider()
-    st.header("3. النتائج")
-    
-    # 1. عرض الدبلجة
-    if st.session_state['dubbed_video']:
-        st.subheader("🎥 الفيديو المدبلج")
-        st.video(st.session_state['dubbed_video'])
-        with open(st.session_state['dubbed_video'], "rb") as f:
-            st.download_button("تحميل الفيديو المدبلج", f, file_name="dubbed_video.mp4")
-    
-    # 2. عرض المقاطع المقصوصة
-    if st.session_state['clips_list']:
-        st.subheader("🔥 المقاطع الأكثر رواجاً (Viral Clips)")
-        cols = st.columns(len(st.session_state['clips_list'])) if len(st.session_state['clips_list']) > 0 else [st.container()]
-        
-        for i, clip in enumerate(st.session_state['clips_list']):
-            # عرض المقاطع بشكل جميل
-            st.write(f"**📌 {clip['label']}**")
-            st.video(clip['path'])
-            with open(clip['path'], "rb") as f:
-                # المفتاح (key) هنا هو السر لعدم اختفاء الأزرار
-                st.download_button(
-                    label=f"تحميل المقطع {i+1}",
-                    data=f,
-                    file_name=clip['path'],
-                    key=f"btn_{i}" 
-                )
+        # --- المرحلة 2: عرض النتيجة والتنفيذ ---
+        if st.session_state['analysis_done']:
             st.divider()
+            st.info("📊 نتيجة التحليل:")
+            
+            # تقرير الدبلجة
+            if enable_dubbing:
+                st.write("✅ الدبلجة: جاهزة للتنفيذ.")
+            
+            # تقرير القص (هنا يظهر العدد قبل التنفيذ)
+            if enable_clipping:
+                count = len(st.session_state['clips_data'])
+                if count > 0:
+                    st.success(f"وجدنا {count} مقاطع مرشحة للانتشار.")
+                    st.json(st.session_state['clips_data']) # عرض التفاصيل بشفافية
+                else:
+                    st.warning("لم يجد الذكاء الاصطناعي مقاطع قوية، لكن يمكنك المتابعة.")
+            
+            st.divider()
+            
+            # زر التنفيذ النهائي
+            if st.button("🚀 تنفيذ القص والدبلجة الآن", type="primary", use_container_width=True):
+                with st.status("جاري المعالجة النهائية...", expanded=True) as status:
+                    
+                    # 1. تنفيذ الدبلجة
+                    if enable_dubbing:
+                        status.write("🎙️ جاري الدبلجة...")
+                        aud = extract_audio(video_path)
+                        gend = detect_speaker_gender(aud)
+                        txt = transcribe_and_translate(aud, target_lang)
+                        if txt:
+                            voice = "21m00Tcm4TlvDq8ikWAM" if gend == "female" else "pNInz6obpgDQGcFmaJgB"
+                            dub = generate_dubbed_audio(txt, voice)
+                            if dub: st.session_state['dubbed_video'] = merge_audio_video(video_path, dub)
+                    
+                    # 2. تنفيذ القص (بناء على التحليل السابق)
+                    if enable_clipping and st.session_state['clips_data']:
+                        status.write("✂️ جاري قص المقاطع...")
+                        st.session_state['generated_clips'] = cut_clips_processing(video_path, st.session_state['clips_data'])
+                    
+                    status.update(label="✅ تمت العملية بنجاح!", state="complete")
+
+# --- عرض النتائج النهائية ---
+if st.session_state['dubbed_video']:
+    st.header("🎥 الفيديو المدبلج")
+    st.video(st.session_state['dubbed_video'])
+
+if st.session_state['generated_clips']:
+    st.header("🔥 المقاطع المستخرجة")
+    for i, clip in enumerate(st.session_state['generated_clips']):
+        st.write(f"**{clip['label']}**")
+        st.video(clip['path'])
