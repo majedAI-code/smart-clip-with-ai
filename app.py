@@ -34,34 +34,43 @@ GOOGLE_API_KEY, ELEVENLABS_API_KEY = load_api_keys()
 genai.configure(api_key=GOOGLE_API_KEY)
 eleven_client = ElevenLabs(api_key=ELEVENLABS_API_KEY)
 
-# --- 3. (هام جداً) دالة اكتشاف الموديل الصحيح لتجنب 404 ---
+# --- 3. (الحل الجذري) دالة اختيار الموديل الذكية ---
 @st.cache_resource
 def get_working_model_name():
-    # قائمة الموديلات المحتملة بالترتيب
-    candidates = [
-        "gemini-1.5-flash", 
-        "gemini-1.5-flash-latest",
-        "models/gemini-1.5-flash",
-        "gemini-1.5-pro",
-        "gemini-pro"
-    ]
     try:
-        # نسأل جوجل: ما هي الموديلات المتاحة لهذا الحساب؟
-        available_models = [m.name for m in genai.list_models()]
+        # نجلب كل الموديلات المتاحة للحساب
+        models = list(genai.list_models())
         
-        # نبحث عن أول موديل متاح من قائمتنا
-        for c in candidates:
-            # نتأكد إذا الاسم موجود كما هو أو مع بادئة models/
-            if c in available_models or f"models/{c}" in available_models:
-                return c
-    except:
-        pass
-    
-    # في أسوأ الأحوال نعود للموديل القديم المستقر
-    return "gemini-pro"
+        # نفلتر الموديلات التي تدعم "توليد المحتوى" فقط
+        generation_models = [m.name for m in models if 'generateContent' in m.supported_generation_methods]
+        
+        # الترتيب المفضل للاختيار:
+        # 1. نبحث عن Flash 1.5 (الأسرع والأرخص)
+        for m in generation_models:
+            if 'gemini-1.5-flash' in m: return m
+            
+        # 2. نبحث عن Pro 1.5 (الأقوى)
+        for m in generation_models:
+            if 'gemini-1.5-pro' in m: return m
+            
+        # 3. نبحث عن أي موديل Flash آخر
+        for m in generation_models:
+            if 'flash' in m: return m
+            
+        # 4. الخيار الأخير: خذ أول موديل متاح في القائمة وأمري لله
+        if generation_models:
+            return generation_models[0]
+            
+    except Exception as e:
+        st.sidebar.error(f"فشل الاتصال بقائمة الموديلات: {e}")
+        
+    # احتياط نهائي لو كل شيء فشل
+    return "models/gemini-1.5-flash"
 
-# تحديد الموديل تلقائياً مرة واحدة
+# تحديد الموديل
 CURRENT_MODEL_NAME = get_working_model_name()
+# عرض الموديل المستخدم في السايدبار للتأكد
+st.sidebar.success(f"🤖 الموديل النشط: {CURRENT_MODEL_NAME}")
 
 # --- 4. إدارة الحالة ---
 if 'dubbed_video' not in st.session_state: st.session_state['dubbed_video'] = None
@@ -83,7 +92,7 @@ def extract_audio(video_path):
     audio_path = "temp_audio.mp3"
     video.audio.write_audiofile(
         audio_path, 
-        bitrate="64k",      # جودة متوسطة آمنة
+        bitrate="64k",
         fps=22050,          
         codec="libmp3lame",
         logger=None
@@ -102,13 +111,11 @@ def detect_speaker_gender(audio_path):
     except: return "male"
 
 def transcribe_and_translate(audio_path, target_lang):
-    # نستخدم الموديل الذي اكتشفناه تلقائياً
     model = genai.GenerativeModel(CURRENT_MODEL_NAME)
     try:
         with open(audio_path, "rb") as f: audio_data = f.read()
         prompt = f"Transcribe the speech and translate it to {target_lang}. Return ONLY the translated text."
         
-        # إيقاف فلاتر الأمان
         safety_settings = [
             {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
             {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
@@ -122,7 +129,9 @@ def transcribe_and_translate(audio_path, target_lang):
         )
         return response.text
     except Exception as e:
-        st.error(f"خطأ Gemini ({CURRENT_MODEL_NAME}): {e}")
+        # طباعة الخطأ بوضوح
+        st.error(f"❌ خطأ الترجمة: {e}")
+        st.info(f"الموديل المستخدم: {CURRENT_MODEL_NAME}")
         return None
 
 def generate_dubbed_audio(text, voice_id):
@@ -239,8 +248,8 @@ if video_path:
                     status.write("1. استخراج الصوت...")
                     aud = extract_audio(video_path)
                     
-                    status.write(f"2. تحليل الهوية والترجمة (الموديل: {CURRENT_MODEL_NAME})...")
-                    # قمنا بدمج الخطوتين لتوفير الوقت
+                    status.write("2. تحليل الهوية والترجمة...")
+                    # نمرر اسم الموديل للتأكد
                     txt = transcribe_and_translate(aud, target_lang)
                     gend = detect_speaker_gender(aud)
                     
@@ -256,7 +265,7 @@ if video_path:
                         else:
                             status.update(label="❌ فشل توليد الصوت", state="error")
                     else:
-                        status.update(label="❌ فشلت الترجمة (تحقق من الموديل)", state="error")
+                        status.update(label="❌ فشلت الترجمة", state="error")
 
         # === القص ===
         with col_cut:
