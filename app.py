@@ -34,14 +34,40 @@ GOOGLE_API_KEY, ELEVENLABS_API_KEY = load_api_keys()
 genai.configure(api_key=GOOGLE_API_KEY)
 eleven_client = ElevenLabs(api_key=ELEVENLABS_API_KEY)
 
-# --- 3. اختيار الموديل (تثبيت على Flash لضمان السرعة) ---
-CURRENT_MODEL_NAME = "gemini-1.5-flash"
+# --- 3. (هام جداً) دالة اكتشاف الموديل الصحيح لتجنب 404 ---
+@st.cache_resource
+def get_working_model_name():
+    # قائمة الموديلات المحتملة بالترتيب
+    candidates = [
+        "gemini-1.5-flash", 
+        "gemini-1.5-flash-latest",
+        "models/gemini-1.5-flash",
+        "gemini-1.5-pro",
+        "gemini-pro"
+    ]
+    try:
+        # نسأل جوجل: ما هي الموديلات المتاحة لهذا الحساب؟
+        available_models = [m.name for m in genai.list_models()]
+        
+        # نبحث عن أول موديل متاح من قائمتنا
+        for c in candidates:
+            # نتأكد إذا الاسم موجود كما هو أو مع بادئة models/
+            if c in available_models or f"models/{c}" in available_models:
+                return c
+    except:
+        pass
+    
+    # في أسوأ الأحوال نعود للموديل القديم المستقر
+    return "gemini-pro"
+
+# تحديد الموديل تلقائياً مرة واحدة
+CURRENT_MODEL_NAME = get_working_model_name()
 
 # --- 4. إدارة الحالة ---
 if 'dubbed_video' not in st.session_state: st.session_state['dubbed_video'] = None
 if 'generated_clips' not in st.session_state: st.session_state['generated_clips'] = []
 
-# --- 5. دوال المعالجة (المستقرة) ---
+# --- 5. دوال المعالجة ---
 
 def check_video_duration(video_path, max_minutes=5):
     try:
@@ -53,13 +79,12 @@ def check_video_duration(video_path, max_minutes=5):
     except: return True, 0
 
 def extract_audio(video_path):
-    # عدلنا الإعدادات لتكون مقبولة لدى Gemini
     video = VideoFileClip(video_path)
     audio_path = "temp_audio.mp3"
     video.audio.write_audiofile(
         audio_path, 
-        bitrate="64k",      # جودة قياسية (أضمن من 32k)
-        fps=22050,          # تردد قياسي للصوت البشري
+        bitrate="64k",      # جودة متوسطة آمنة
+        fps=22050,          
         codec="libmp3lame",
         logger=None
     )
@@ -77,25 +102,27 @@ def detect_speaker_gender(audio_path):
     except: return "male"
 
 def transcribe_and_translate(audio_path, target_lang):
+    # نستخدم الموديل الذي اكتشفناه تلقائياً
     model = genai.GenerativeModel(CURRENT_MODEL_NAME)
     try:
         with open(audio_path, "rb") as f: audio_data = f.read()
         prompt = f"Transcribe the speech and translate it to {target_lang}. Return ONLY the translated text."
-        # إيقاف فلاتر الأمان لتجنب حظر المحتوى العادي
+        
+        # إيقاف فلاتر الأمان
         safety_settings = [
             {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
             {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
             {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
             {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
         ]
+        
         response = model.generate_content(
             [prompt, {"mime_type": "audio/mp3", "data": audio_data}],
             safety_settings=safety_settings
         )
         return response.text
     except Exception as e:
-        # طباعة الخطأ لمعرفته
-        st.error(f"خطأ في الترجمة: {e}")
+        st.error(f"خطأ Gemini ({CURRENT_MODEL_NAME}): {e}")
         return None
 
 def generate_dubbed_audio(text, voice_id):
@@ -123,7 +150,7 @@ def merge_audio_video(video_path, audio_path):
     new_audio.close()
     return output_path
 
-# --- دالة القص (كما طلبت: العدد والمدة) ---
+# --- دالة القص ---
 def analyze_and_cut_specific(video_path, num_clips, clip_duration):
     model = genai.GenerativeModel(CURRENT_MODEL_NAME)
     video_clip = VideoFileClip(video_path)
@@ -140,7 +167,7 @@ def analyze_and_cut_specific(video_path, num_clips, clip_duration):
         Analyze this video. Find exactly {num_clips} best segments.
         Each segment MUST be exactly {clip_duration} seconds long.
         Return valid JSON only: [{{ "start": 10, "end": {10+clip_duration}, "label": "Topic" }}]
-        Make sure timestamps are within video duration ({total_duration}s).
+        timestamps must be within 0 and {total_duration}.
         """
         response = model.generate_content([prompt, myfile])
         text = response.text.replace("```json", "").replace("```", "").strip()
@@ -172,7 +199,7 @@ def analyze_and_cut_specific(video_path, num_clips, clip_duration):
     video.close()
     return generated_files
 
-# --- 6. الواجهة ---
+# --- الواجهة ---
 render_header("banner.jpg", "استوديو المحتوى الذكي")
 st.caption("أتمتة صناعة المحتوى الإعلامي")
 
@@ -212,26 +239,24 @@ if video_path:
                     status.write("1. استخراج الصوت...")
                     aud = extract_audio(video_path)
                     
-                    status.write("2. تحليل الهوية الصوتية...")
+                    status.write(f"2. تحليل الهوية والترجمة (الموديل: {CURRENT_MODEL_NAME})...")
+                    # قمنا بدمج الخطوتين لتوفير الوقت
+                    txt = transcribe_and_translate(aud, target_lang)
                     gend = detect_speaker_gender(aud)
                     
-                    status.write(f"3. الترجمة إلى {target_lang}...")
-                    txt = transcribe_and_translate(aud, target_lang)
-                    
                     if txt:
-                        status.write("4. توليد الصوت (ElevenLabs)...")
-                        # اختيار صوت مناسب
+                        status.write("3. توليد الصوت (ElevenLabs)...")
                         voice = "21m00Tcm4TlvDq8ikWAM" if gend == "female" else "pNInz6obpgDQGcFmaJgB"
                         dub = generate_dubbed_audio(txt, voice)
                         
                         if dub:
-                            status.write("5. دمج الفيديو النهائي...")
+                            status.write("4. دمج الفيديو النهائي...")
                             st.session_state['dubbed_video'] = merge_audio_video(video_path, dub)
                             status.update(label="✅ تمت الدبلجة!", state="complete")
                         else:
                             status.update(label="❌ فشل توليد الصوت", state="error")
                     else:
-                        status.update(label="❌ فشلت الترجمة (راجع الخطأ أعلاه)", state="error")
+                        status.update(label="❌ فشلت الترجمة (تحقق من الموديل)", state="error")
 
         # === القص ===
         with col_cut:
@@ -257,6 +282,8 @@ if video_path:
         if st.session_state['dubbed_video']:
             st.subheader("🎥 الفيديو المدبلج")
             st.video(st.session_state['dubbed_video'])
+            with open(st.session_state['dubbed_video'], "rb") as f:
+                st.download_button("تحميل المدبلج", f, file_name="dubbed.mp4")
 
         if st.session_state['generated_clips']:
             st.subheader("✂️ المقاطع المستخرجة")
@@ -265,3 +292,5 @@ if video_path:
                 with cols[i]:
                     st.write(f"**{clip['label']}**")
                     st.video(clip['path'])
+                    with open(clip['path'], "rb") as f:
+                        st.download_button("تحميل", f, file_name=clip['path'], key=f"dl_{i}")
