@@ -69,55 +69,40 @@ def render_header(image_name, alt_text):
     else:
         st.header(alt_text)
 
-# === السلاح السري: دبلجة احترافية (نسخة ذكية تتفادى أخطاء المكتبة) ===
+# === السلاح السري: دبلجة احترافية (النسخة الصلبة) ===
 def process_full_dubbing(video_path, target_lang_code):
     try:
-        # 1. البحث عن دالة الدبلجة المتاحة في نسختك
-        dubbing_client = eleven_client.dubbing
-        dub_method = None
-        
-        # قائمة الاحتمالات لاسم الدالة (حسب إصدار المكتبة)
-        candidates = ["dub_a_video_or_an_audio_file", "dub", "create"]
-        
-        for name in candidates:
-            if hasattr(dubbing_client, name):
-                dub_method = getattr(dubbing_client, name)
-                break
-        
-        if not dub_method:
-            # في حال لم نجد أي اسم معروف، نعرض للمستخدم الدوال المتاحة
-            st.error(f"عفواً، لم نتمكن من تحديد دالة الدبلجة في هذه النسخة. الدوال المتاحة هي: {dir(dubbing_client)}")
-            return None
+        # 1. محاولة الرفع (Start Dubbing)
+        try:
+            # المحاولة الأولى: الاسم الجديد
+            with open(video_path, "rb") as f:
+                response = eleven_client.dubbing.dub(
+                    file=f, target_lang=target_lang_code, mode="automatic", source_lang="auto", num_speakers=0, watermark=False
+                )
+        except AttributeError:
+            # المحاولة الثانية: الاسم القديم
+            with open(video_path, "rb") as f:
+                response = eleven_client.dubbing.dub_a_video_or_an_audio_file(
+                    file=f, target_lang=target_lang_code, mode="automatic", source_lang="auto", num_speakers=0, watermark=False
+                )
 
-        # 2. رفع الفيديو باستخدام الدالة التي وجدناها
-        with open(video_path, "rb") as f:
-            response = dub_method(
-                file=f,
-                target_lang=target_lang_code,
-                mode="automatic", 
-                source_lang="auto", 
-                num_speakers=0, 
-                watermark=False
-            )
-        
         dubbing_id = response.dubbing_id
         
-        # 3. انتظار المعالجة (Polling)
+        # 2. انتظار المعالجة (Polling)
         progress_text = "جاري الدبلجة والمزامنة في الاستوديو السحابي..."
         my_bar = st.progress(0, text=progress_text)
         
         while True:
-            # أيضاً نتحقق من اسم دالة جلب المعلومات
-            get_meta = None
-            if hasattr(eleven_client.dubbing, "get_dubbing_project_metadata"):
-                get_meta = eleven_client.dubbing.get_dubbing_project_metadata
-            elif hasattr(eleven_client.dubbing, "get_project_metadata"): # احتمال لاسم مختصر
-                get_meta = eleven_client.dubbing.get_project_metadata
-            elif hasattr(eleven_client.dubbing, "get"):
-                get_meta = eleven_client.dubbing.get
+            # محاولة جلب الحالة بطرق مختلفة
+            try:
+                status = eleven_client.dubbing.get_dubbing_project_metadata(dubbing_id).status
+            except AttributeError:
+                try:
+                    status = eleven_client.dubbing.get_project_metadata(dubbing_id).status
+                except AttributeError:
+                    # الخيار الأخير (لبعض النسخ)
+                    status = eleven_client.dubbing.get(dubbing_id).status
 
-            status = get_meta(dubbing_id).status
-            
             if status == "dubbed":
                 my_bar.progress(100, text="تمت الدبلجة بنجاح!")
                 break
@@ -127,18 +112,15 @@ def process_full_dubbing(video_path, target_lang_code):
             else:
                 time.sleep(2)
         
-        # 4. تحميل الفيديو الجاهز
+        # 3. تحميل الفيديو الجاهز
         output_path = "final_dubbed_video.mp4"
         
-        # نتحقق من اسم دالة تحميل الملف
-        get_file = None
-        if hasattr(eleven_client.dubbing, "get_dubbed_file"):
-            get_file = eleven_client.dubbing.get_dubbed_file
-        elif hasattr(eleven_client.dubbing, "get_file"):
-            get_file = eleven_client.dubbing.get_file
+        # محاولة تحميل الملف بطرق مختلفة
+        try:
+            video_bytes = eleven_client.dubbing.get_dubbed_file(dubbing_id, target_lang_code)
+        except AttributeError:
+            video_bytes = eleven_client.dubbing.get_file(dubbing_id, target_lang_code)
             
-        video_bytes = get_file(dubbing_id, target_lang_code)
-        
         with open(output_path, "wb") as f:
             for chunk in video_bytes:
                 f.write(chunk)
@@ -147,7 +129,7 @@ def process_full_dubbing(video_path, target_lang_code):
 
     except Exception as e:
         st.error(f"حدث خطأ غير متوقع: {e}")
-        # هذا السطر سيساعدنا جداً لو استمرت المشكلة
+        # طباعة الدوال المتاحة للمساعدة في التشخيص لو تكرر الخطأ
         # st.write(dir(eleven_client.dubbing)) 
         return None
 
