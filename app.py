@@ -2,7 +2,7 @@ import streamlit as st
 import os
 import json
 import time
-import requests  # مكتبة الاتصال المباشر
+import requests
 import google.generativeai as genai
 from elevenlabs.client import ElevenLabs
 from moviepy.editor import VideoFileClip
@@ -64,17 +64,28 @@ def render_header(image_name, alt_text):
     else:
         st.header(alt_text)
 
-# === (الحل الجذري) دبلجة بالاتصال المباشر API Request ===
+# === دالة الدبلجة (تدعم صيغ متعددة) ===
 def process_full_dubbing(video_path, target_lang_code):
     try:
-        # رابط خدمة الدبلجة المباشر
         url = "https://api.elevenlabs.io/v1/dubbing"
+        headers = {"xi-api-key": ELEVENLABS_API_KEY}
         
-        headers = {
-            "xi-api-key": ELEVENLABS_API_KEY
+        # 1. تحديد نوع الملف (MIME Type) يدوياً وبدقة
+        # نأخذ الامتداد من اسم الملف (مثلاً mp4 أو mov)
+        file_ext = video_path.split(".")[-1].lower()
+        
+        # خريطة الأنواع المدعومة
+        mime_map = {
+            "mp4": "video/mp4",
+            "mov": "video/quicktime",
+            "avi": "video/x-msvideo",
+            "mkv": "video/x-matroska",
+            "webm": "video/webm"
         }
         
-        # 1. إرسال ملف الفيديو (POST)
+        # اختيار النوع المناسب أو افتراض mp4
+        mime_type = mime_map.get(file_ext, "video/mp4")
+        
         with open(video_path, "rb") as f:
             data = {
                 "target_lang": target_lang_code,
@@ -83,27 +94,28 @@ def process_full_dubbing(video_path, target_lang_code):
                 "num_speakers": "0",
                 "watermark": "false"
             }
-            files = {"file": f}
+            
+            # نرسل الملف مع نوعه الصحيح
+            files = {
+                "file": (os.path.basename(video_path), f, mime_type) 
+            }
             
             response = requests.post(url, headers=headers, data=data, files=files)
         
         if response.status_code != 200:
-            st.error(f"خطأ في الاتصال بالسيرفر: {response.text}")
+            st.error(f"خطأ من ElevenLabs: {response.text}")
             return None
             
         dubbing_id = response.json().get("dubbing_id")
         
-        # 2. انتظار المعالجة (Polling)
+        # 2. انتظار المعالجة
         progress_text = "جاري الدبلجة والمزامنة (Pro)..."
         my_bar = st.progress(0, text=progress_text)
         
         while True:
-            # التحقق من الحالة
             status_url = f"https://api.elevenlabs.io/v1/dubbing/{dubbing_id}"
             status_response = requests.get(status_url, headers=headers)
-            status_data = status_response.json()
-            
-            status = status_data.get("status")
+            status = status_response.json().get("status")
             
             if status == "dubbed":
                 my_bar.progress(100, text="تمت الدبلجة بنجاح!")
@@ -112,12 +124,10 @@ def process_full_dubbing(video_path, target_lang_code):
                 st.error("فشلت عملية الدبلجة في المصدر.")
                 return None
             else:
-                time.sleep(2) # انتظار
+                time.sleep(2) 
         
         # 3. تحميل الفيديو الجاهز
-        # ملاحظة: لتحميل الفيديو نستخدم رابط خاص
         download_url = f"https://api.elevenlabs.io/v1/dubbing/{dubbing_id}/audio/{target_lang_code}"
-        
         dl_response = requests.get(download_url, headers=headers, stream=True)
         
         output_path = "final_dubbed_video.mp4"
@@ -190,10 +200,14 @@ upload_option = st.radio("المصدر:", ["رفع ملف", "رابط يوتيو
 video_path = None
 
 if upload_option == "رفع ملف":
-    uploaded_file = st.file_uploader("ملف MP4", type=["mp4"])
+    # الآن نسمح بأكثر من صيغة
+    uploaded_file = st.file_uploader("ملف فيديو (MP4, MOV, AVI, MKV)", type=["mp4", "mov", "avi", "mkv"])
     if uploaded_file:
-        with open("temp_video.mp4", "wb") as f: f.write(uploaded_file.getbuffer())
-        video_path = "temp_video.mp4"
+        # حفظ الملف بامتداده الأصلي
+        file_ext = uploaded_file.name.split(".")[-1].lower()
+        video_path = f"temp_video.{file_ext}"
+        with open(video_path, "wb") as f: f.write(uploaded_file.getbuffer())
+        
 elif upload_option == "رابط يوتيوب (فيديو Demo)":
     yt_url = st.text_input("أدخل رابط الفيديو:", placeholder="https://www.youtube.com/watch?v=...")
     if st.button("تحميل الفيديو") and os.path.exists("sample.mp4"):
