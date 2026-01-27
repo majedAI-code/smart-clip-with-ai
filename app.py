@@ -28,26 +28,20 @@ GOOGLE_API_KEY, ELEVENLABS_API_KEY = load_api_keys()
 genai.configure(api_key=GOOGLE_API_KEY)
 eleven_client = ElevenLabs(api_key=ELEVENLABS_API_KEY)
 
-# --- 3. اختيار موديل Gemini تلقائياً ---
+# --- 3. موديل Gemini ---
 @st.cache_resource
 def get_working_model_name():
     try:
-        models = list(genai.list_models())
-        generation_models = [m.name for m in models if 'generateContent' in m.supported_generation_methods]
-        
-        # الأولوية للنسخ السريعة والحديثة
-        for m in generation_models:
+        models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
+        for m in models: 
             if 'gemini-1.5-flash' in m: return m
-        for m in generation_models:
-            if 'gemini-1.5-pro' in m: return m
-        if generation_models:
-            return generation_models[0]
+        if models: return models[0]
     except: pass
     return "models/gemini-1.5-flash"
 
 CURRENT_MODEL_NAME = get_working_model_name()
 
-# --- 4. إدارة الحالة (Session State) ---
+# --- 4. إدارة الحالة ---
 if 'dubbed_video' not in st.session_state: st.session_state['dubbed_video'] = None
 if 'generated_clips' not in st.session_state: st.session_state['generated_clips'] = []
 if 'dubbed_clips_results' not in st.session_state: st.session_state['dubbed_clips_results'] = []
@@ -69,42 +63,55 @@ def render_header(image_name, alt_text):
     else:
         st.header(alt_text)
 
-# === السلاح السري: دبلجة احترافية (النسخة الصلبة) ===
+# === دالة الدبلجة (الحل الجذري) ===
 def process_full_dubbing(video_path, target_lang_code):
     try:
-        # 1. محاولة الرفع (Start Dubbing)
-        try:
-            # المحاولة الأولى: الاسم الجديد
-            with open(video_path, "rb") as f:
-                response = eleven_client.dubbing.dub(
-                    file=f, target_lang=target_lang_code, mode="automatic", source_lang="auto", num_speakers=0, watermark=False
-                )
-        except AttributeError:
-            # المحاولة الثانية: الاسم القديم
-            with open(video_path, "rb") as f:
-                response = eleven_client.dubbing.dub_a_video_or_an_audio_file(
-                    file=f, target_lang=target_lang_code, mode="automatic", source_lang="auto", num_speakers=0, watermark=False
-                )
+        # 1. الفحص الذكي: ماذا يوجد داخل مكتبة ElevenLabs عندك؟
+        available_methods = [m for m in dir(eleven_client.dubbing) if not m.startswith('_')]
+        
+        # البحث عن الاسم الصحيح
+        method_name = None
+        if "dub" in available_methods:
+            method_name = "dub"
+        elif "dub_a_video_or_an_audio_file" in available_methods:
+            method_name = "dub_a_video_or_an_audio_file"
+        
+        # إذا لم نجد الاسم، نعرض المتاح للمستخدم لنعرف الحل
+        if not method_name:
+            st.error(f"⚠️ خطأ في المكتبة: لم نجد دالة الدبلجة. الدوال المتاحة هي: {available_methods}")
+            return None
 
+        # 2. تنفيذ الدبلجة بالدالة التي وجدناها
+        dub_func = getattr(eleven_client.dubbing, method_name)
+        
+        with open(video_path, "rb") as f:
+            response = dub_func(
+                file=f,
+                target_lang=target_lang_code,
+                mode="automatic", 
+                source_lang="auto", 
+                num_speakers=0, 
+                watermark=False
+            )
+        
         dubbing_id = response.dubbing_id
         
-        # 2. انتظار المعالجة (Polling)
-        progress_text = "جاري الدبلجة والمزامنة في الاستوديو السحابي..."
+        # 3. انتظار المعالجة
+        progress_text = "جاري الدبلجة والمزامنة (Pro)..."
         my_bar = st.progress(0, text=progress_text)
         
         while True:
-            # محاولة جلب الحالة بطرق مختلفة
+            # محاولة جلب الحالة بأكثر من طريقة
+            status = "pending"
             try:
-                status = eleven_client.dubbing.get_dubbing_project_metadata(dubbing_id).status
-            except AttributeError:
-                try:
+                if hasattr(eleven_client.dubbing, "get_dubbing_project_metadata"):
+                    status = eleven_client.dubbing.get_dubbing_project_metadata(dubbing_id).status
+                elif hasattr(eleven_client.dubbing, "get_project_metadata"):
                     status = eleven_client.dubbing.get_project_metadata(dubbing_id).status
-                except AttributeError:
-                    # الخيار الأخير (لبعض النسخ)
-                    status = eleven_client.dubbing.get(dubbing_id).status
+            except: pass
 
             if status == "dubbed":
-                my_bar.progress(100, text="تمت الدبلجة بنجاح!")
+                my_bar.progress(100, text="تمت الدبلجة!")
                 break
             elif status == "failed":
                 st.error("فشلت عملية الدبلجة من المصدر.")
@@ -112,25 +119,26 @@ def process_full_dubbing(video_path, target_lang_code):
             else:
                 time.sleep(2)
         
-        # 3. تحميل الفيديو الجاهز
+        # 4. تحميل الملف
         output_path = "final_dubbed_video.mp4"
         
-        # محاولة تحميل الملف بطرق مختلفة
-        try:
+        # محاولة جلب الملف بأكثر من اسم
+        video_bytes = None
+        if hasattr(eleven_client.dubbing, "get_dubbed_file"):
             video_bytes = eleven_client.dubbing.get_dubbed_file(dubbing_id, target_lang_code)
-        except AttributeError:
+        elif hasattr(eleven_client.dubbing, "get_file"):
             video_bytes = eleven_client.dubbing.get_file(dubbing_id, target_lang_code)
             
-        with open(output_path, "wb") as f:
-            for chunk in video_bytes:
-                f.write(chunk)
-                
-        return output_path
+        if video_bytes:
+            with open(output_path, "wb") as f:
+                for chunk in video_bytes: f.write(chunk)
+            return output_path
+        else:
+            st.error("لم نتمكن من تحميل ملف الفيديو النهائي.")
+            return None
 
     except Exception as e:
-        st.error(f"حدث خطأ غير متوقع: {e}")
-        # طباعة الدوال المتاحة للمساعدة في التشخيص لو تكرر الخطأ
-        # st.write(dir(eleven_client.dubbing)) 
+        st.error(f"خطأ غير متوقع: {e}")
         return None
 
 # === دالة القص الذكي ===
@@ -150,7 +158,7 @@ def analyze_and_cut_specific(video_path, num_clips, clip_duration, prefix="clip"
         Analyze this video. Find exactly {num_clips} best segments.
         Each segment MUST be exactly {clip_duration} seconds long.
         Return valid JSON only: [{{ "start": 10, "end": {10+clip_duration}, "label": "Topic" }}]
-        Timestamps must be strictly within 0 and {total_duration}.
+        Timestamps must be within 0 and {total_duration}.
         """
         response = model.generate_content([prompt, myfile])
         text = response.text.replace("```json", "").replace("```", "").strip()
@@ -164,25 +172,18 @@ def analyze_and_cut_specific(video_path, num_clips, clip_duration, prefix="clip"
 
     video = VideoFileClip(video_path)
     generated_files = []
-    
     for i, item in enumerate(timestamps):
         try:
             start = float(item.get('start'))
             end = start + float(clip_duration)
             if end > video.duration: end = video.duration
             if start >= end: continue
-
             label = item.get('label', f'{prefix} {i+1}')
-            
-            # قص سريع جداً
             clip = video.subclip(start, end)
             name = f"{prefix}_{i}_{label}.mp4".replace(" ", "_")
-            clip.write_videofile(
-                name, codec="libx264", audio_codec="aac", preset="ultrafast", threads=4, logger=None
-            )
+            clip.write_videofile(name, codec="libx264", audio_codec="aac", preset="ultrafast", threads=4, logger=None)
             generated_files.append({"path": name, "label": label})
         except: continue
-        
     video.close()
     return generated_files
 
@@ -190,7 +191,6 @@ def analyze_and_cut_specific(video_path, num_clips, clip_duration, prefix="clip"
 render_header("banner.jpg", "استوديو المحتوى الذكي")
 st.caption("أتمتة صناعة المحتوى الإعلامي (Pro Edition)")
 
-# قسم الرفع
 st.markdown("### 1. رفع الفيديو")
 upload_option = st.radio("المصدر:", ["رفع ملف", "رابط يوتيوب (فيديو Demo)"], horizontal=True)
 video_path = None
@@ -200,14 +200,11 @@ if upload_option == "رفع ملف":
     if uploaded_file:
         with open("temp_video.mp4", "wb") as f: f.write(uploaded_file.getbuffer())
         video_path = "temp_video.mp4"
-
 elif upload_option == "رابط يوتيوب (فيديو Demo)":
     yt_url = st.text_input("أدخل رابط الفيديو:", placeholder="https://www.youtube.com/watch?v=...")
     if st.button("تحميل الفيديو") and os.path.exists("sample.mp4"):
         video_path = "sample.mp4"
         st.success("تم جلب الفيديو بنجاح! (Demo Mode)")
-    elif not os.path.exists("sample.mp4"):
-        st.warning("ملف sample.mp4 غير موجود.")
 
 if video_path:
     valid, dur = check_video_duration(video_path, 5)
@@ -218,97 +215,69 @@ if video_path:
         st.divider()
         col_dub, col_cut = st.columns(2)
 
-        # === العمود 1: الدبلجة الاحترافية ===
         with col_dub:
             render_header("dubbing.png", "🎙️ الدبلجة")
             st.markdown("---")
-            # خريطة لغات ElevenLabs
-            lang_map = {
-                "Arabic": "ar", "English": "en", "French": "fr", "Spanish": "es", 
-                "German": "de", "Chinese": "zh", "Japanese": "ja", "Russian": "ru"
-            }
+            lang_map = {"Arabic": "ar", "English": "en", "French": "fr", "Spanish": "es", "German": "de", "Chinese": "zh"}
             target_lang_name = st.selectbox("اللغة المستهدفة", list(lang_map.keys()))
-            target_code = lang_map[target_lang_name]
             
             if st.button("🚀 تنفيذ الدبلجة (Pro)", use_container_width=True):
                 st.session_state['dubbed_video'] = None
                 with st.status("جاري الاتصال باستوديو الدبلجة...", expanded=True) as status:
                     status.write("1. رفع الفيديو وتحليل المتحدثين...")
-                    final_vid = process_full_dubbing(video_path, target_code)
-                    
+                    final_vid = process_full_dubbing(video_path, lang_map[target_lang_name])
                     if final_vid:
                         st.session_state['dubbed_video'] = final_vid
                         status.update(label="✅ تمت الدبلجة والمزامنة!", state="complete")
                     else:
                         status.update(label="❌ فشلت العملية", state="error")
 
-        # === العمود 2: القص (للفيديو الأصلي المرفوع) ===
         with col_cut:
             render_header("clipping.png", "✂️ القص الذكي (للأصل)")
             st.markdown("---")
-            num_clips = st.number_input("عدد المقاطع", 1, 5, 2, key="orig_num")
-            clip_dur = st.number_input("المدة (ثانية)", 10, 60, 20, key="orig_dur")
-            
+            num_clips = st.number_input("العدد", 1, 5, 2, key="on")
+            clip_dur = st.number_input("المدة", 10, 60, 20, key="od")
             if st.button("🚀 قص الفيديو الأصلي", use_container_width=True):
                 st.session_state['generated_clips'] = []
                 with st.status("جاري القص...", expanded=True) as status:
-                    clips = analyze_and_cut_specific(video_path, num_clips, clip_dur, prefix="orig_clip")
+                    clips = analyze_and_cut_specific(video_path, num_clips, clip_dur, prefix="orig")
                     if clips:
                         st.session_state['generated_clips'] = clips
                         status.update(label="✅ تم القص!", state="complete")
                     else:
-                        status.update(label="❌ خطأ في القص", state="error")
+                        status.update(label="❌ خطأ", state="error")
 
         st.divider()
         st.header("النتائج")
 
-        # 1. عرض الدبلجة
         if st.session_state['dubbed_video']:
-            st.subheader("🎥 الفيديو المدبلج (Pro)")
+            st.subheader("🎥 الفيديو المدبلج")
             st.video(st.session_state['dubbed_video'])
-            
             with open(st.session_state['dubbed_video'], "rb") as f:
-                st.download_button("تحميل الفيديو المدبلج", f, file_name="dubbed_pro.mp4", key="dl_main_dub")
+                st.download_button("تحميل المدبلج", f, "dubbed_pro.mp4")
             
-            # --- قص الفيديو المدبلج ---
             st.markdown("---")
-            st.markdown("#### ✂️ استخراج مقاطع من هذا الفيديو المدبلج")
+            st.write("✂️ **قص المدبلج:**")
             c1, c2, c3 = st.columns([1,1,1])
-            with c1: d_num = st.number_input("العدد", 1, 5, 2, key="d_n")
-            with c2: d_dur = st.number_input("المدة", 10, 60, 20, key="d_d")
+            with c1: dn = st.number_input("العدد", 1, 5, 2, key="dn")
+            with c2: dd = st.number_input("المدة", 10, 60, 20, key="dd")
             with c3:
                 st.write("")
                 st.write("")
-                if st.button("قص المدبلج الآن"):
-                    st.session_state['dubbed_clips_results'] = []
-                    with st.spinner("جاري قص النسخة المدبلجة..."):
-                        d_clips = analyze_and_cut_specific(
-                            st.session_state['dubbed_video'], d_num, d_dur, prefix="dub_clip"
-                        )
-                        if d_clips:
-                            st.session_state['dubbed_clips_results'] = d_clips
-                            st.success("تم القص!")
+                if st.button("قص الآن"):
+                    st.session_state['dubbed_clips_results'] = analyze_and_cut_specific(st.session_state['dubbed_video'], dn, dd, prefix="dub")
             
-            # عرض مقاطع المدبلج
             if st.session_state['dubbed_clips_results']:
-                st.write("**المقاطع المدبلجة:**")
-                dc_cols = st.columns(len(st.session_state['dubbed_clips_results']))
+                dc = st.columns(len(st.session_state['dubbed_clips_results']))
                 for i, clip in enumerate(st.session_state['dubbed_clips_results']):
-                    with dc_cols[i]:
-                        st.caption(clip['label'])
+                    with dc[i]:
                         st.video(clip['path'])
-                        with open(clip['path'], "rb") as f:
-                            st.download_button("📥", f, file_name=clip['path'], key=f"dl_dclip_{i}")
+                        with open(clip['path'], "rb") as f: st.download_button("📥", f, clip['path'], key=f"d{i}")
 
-        st.divider()
-
-        # 2. عرض قص الأصل
         if st.session_state['generated_clips']:
-            st.subheader("✂️ مقاطع من الفيديو الأصلي")
-            oc_cols = st.columns(len(st.session_state['generated_clips']))
+            st.subheader("✂️ مقاطع الأصل")
+            oc = st.columns(len(st.session_state['generated_clips']))
             for i, clip in enumerate(st.session_state['generated_clips']):
-                with oc_cols[i]:
-                    st.caption(clip['label'])
+                with oc[i]:
                     st.video(clip['path'])
-                    with open(clip['path'], "rb") as f:
-                        st.download_button("📥", f, file_name=clip['path'], key=f"dl_oclip_{i}")
+                    with open(clip['path'], "rb") as f: st.download_button("📥", f, clip['path'], key=f"o{i}")
