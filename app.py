@@ -2,6 +2,7 @@ import streamlit as st
 import os
 import json
 import time
+import requests  # مكتبة الاتصال المباشر
 import google.generativeai as genai
 from elevenlabs.client import ElevenLabs
 from moviepy.editor import VideoFileClip
@@ -63,82 +64,75 @@ def render_header(image_name, alt_text):
     else:
         st.header(alt_text)
 
-# === دالة الدبلجة (الحل الجذري) ===
+# === (الحل الجذري) دبلجة بالاتصال المباشر API Request ===
 def process_full_dubbing(video_path, target_lang_code):
     try:
-        # 1. الفحص الذكي: ماذا يوجد داخل مكتبة ElevenLabs عندك؟
-        available_methods = [m for m in dir(eleven_client.dubbing) if not m.startswith('_')]
+        # رابط خدمة الدبلجة المباشر
+        url = "https://api.elevenlabs.io/v1/dubbing"
         
-        # البحث عن الاسم الصحيح
-        method_name = None
-        if "dub" in available_methods:
-            method_name = "dub"
-        elif "dub_a_video_or_an_audio_file" in available_methods:
-            method_name = "dub_a_video_or_an_audio_file"
+        headers = {
+            "xi-api-key": ELEVENLABS_API_KEY
+        }
         
-        # إذا لم نجد الاسم، نعرض المتاح للمستخدم لنعرف الحل
-        if not method_name:
-            st.error(f"⚠️ خطأ في المكتبة: لم نجد دالة الدبلجة. الدوال المتاحة هي: {available_methods}")
-            return None
-
-        # 2. تنفيذ الدبلجة بالدالة التي وجدناها
-        dub_func = getattr(eleven_client.dubbing, method_name)
-        
+        # 1. إرسال ملف الفيديو (POST)
         with open(video_path, "rb") as f:
-            response = dub_func(
-                file=f,
-                target_lang=target_lang_code,
-                mode="automatic", 
-                source_lang="auto", 
-                num_speakers=0, 
-                watermark=False
-            )
+            data = {
+                "target_lang": target_lang_code,
+                "mode": "automatic",
+                "source_lang": "auto",
+                "num_speakers": "0",
+                "watermark": "false"
+            }
+            files = {"file": f}
+            
+            response = requests.post(url, headers=headers, data=data, files=files)
         
-        dubbing_id = response.dubbing_id
+        if response.status_code != 200:
+            st.error(f"خطأ في الاتصال بالسيرفر: {response.text}")
+            return None
+            
+        dubbing_id = response.json().get("dubbing_id")
         
-        # 3. انتظار المعالجة
+        # 2. انتظار المعالجة (Polling)
         progress_text = "جاري الدبلجة والمزامنة (Pro)..."
         my_bar = st.progress(0, text=progress_text)
         
         while True:
-            # محاولة جلب الحالة بأكثر من طريقة
-            status = "pending"
-            try:
-                if hasattr(eleven_client.dubbing, "get_dubbing_project_metadata"):
-                    status = eleven_client.dubbing.get_dubbing_project_metadata(dubbing_id).status
-                elif hasattr(eleven_client.dubbing, "get_project_metadata"):
-                    status = eleven_client.dubbing.get_project_metadata(dubbing_id).status
-            except: pass
-
+            # التحقق من الحالة
+            status_url = f"https://api.elevenlabs.io/v1/dubbing/{dubbing_id}"
+            status_response = requests.get(status_url, headers=headers)
+            status_data = status_response.json()
+            
+            status = status_data.get("status")
+            
             if status == "dubbed":
-                my_bar.progress(100, text="تمت الدبلجة!")
+                my_bar.progress(100, text="تمت الدبلجة بنجاح!")
                 break
             elif status == "failed":
-                st.error("فشلت عملية الدبلجة من المصدر.")
+                st.error("فشلت عملية الدبلجة في المصدر.")
                 return None
             else:
-                time.sleep(2)
+                time.sleep(2) # انتظار
         
-        # 4. تحميل الملف
+        # 3. تحميل الفيديو الجاهز
+        # ملاحظة: لتحميل الفيديو نستخدم رابط خاص
+        download_url = f"https://api.elevenlabs.io/v1/dubbing/{dubbing_id}/audio/{target_lang_code}"
+        
+        dl_response = requests.get(download_url, headers=headers, stream=True)
+        
         output_path = "final_dubbed_video.mp4"
         
-        # محاولة جلب الملف بأكثر من اسم
-        video_bytes = None
-        if hasattr(eleven_client.dubbing, "get_dubbed_file"):
-            video_bytes = eleven_client.dubbing.get_dubbed_file(dubbing_id, target_lang_code)
-        elif hasattr(eleven_client.dubbing, "get_file"):
-            video_bytes = eleven_client.dubbing.get_file(dubbing_id, target_lang_code)
-            
-        if video_bytes:
+        if dl_response.status_code == 200:
             with open(output_path, "wb") as f:
-                for chunk in video_bytes: f.write(chunk)
+                for chunk in dl_response.iter_content(chunk_size=1024):
+                    f.write(chunk)
             return output_path
         else:
-            st.error("لم نتمكن من تحميل ملف الفيديو النهائي.")
+            st.error(f"فشل تحميل الملف النهائي: {dl_response.text}")
             return None
 
     except Exception as e:
-        st.error(f"خطأ غير متوقع: {e}")
+        st.error(f"حدث خطأ غير متوقع: {e}")
         return None
 
 # === دالة القص الذكي ===
